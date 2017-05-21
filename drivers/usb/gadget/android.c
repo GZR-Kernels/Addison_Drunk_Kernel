@@ -489,7 +489,7 @@ static void android_work(struct work_struct *data)
 		}
 		pr_info("%s: sent uevent %s\n", __func__, uevent_envp[0]);
 	} else {
-		pr_info("%s: did not send uevent (%d %d %p)\n", __func__,
+		pr_info("%s: did not send uevent (%d %d %pK)\n", __func__,
 			 dev->connected, dev->sw_connected, cdev->config);
 	}
 }
@@ -538,9 +538,13 @@ static void android_disable(struct android_dev *dev)
 {
 	struct usb_composite_dev *cdev = dev->cdev;
 	struct android_configuration *conf;
+	bool do_put = false;
 
 	if (dev->disable_depth++ == 0) {
-		usb_gadget_autopm_get(cdev->gadget);
+		if (cdev->suspended && cdev->config) {
+			usb_gadget_autopm_get(cdev->gadget);
+			do_put = true;
+		}
 		if (gadget_is_dwc3(cdev->gadget)) {
 			/* Cancel pending control requests */
 			usb_ep_dequeue(cdev->gadget->ep0, cdev->req);
@@ -559,7 +563,8 @@ static void android_disable(struct android_dev *dev)
 			list_for_each_entry(conf, &dev->configs, list_item)
 				usb_remove_config(cdev, &conf->usb_config);
 		}
-		usb_gadget_autopm_put_async(cdev->gadget);
+		if (do_put)
+			usb_gadget_autopm_put_async(cdev->gadget);
 	}
 }
 
@@ -1933,6 +1938,7 @@ static int serial_function_bind_config(struct android_usb_function *f,
 	err = gport_setup(c);
 	if (err) {
 		pr_err("serial: Cannot setup transports");
+		gserial_deinit_port();
 		goto out;
 	}
 
@@ -4198,7 +4204,7 @@ static int usb_diag_update_pid_and_serial_num(u32 pid, const char *snum)
 		return -ENODEV;
 	}
 
-	pr_debug("%s: dload:%p pid:%x serial_num:%s\n",
+	pr_debug("%s: dload:%pK pid:%x serial_num:%s\n",
 				__func__, diag_dload, pid, snum);
 
 	/* update pid */

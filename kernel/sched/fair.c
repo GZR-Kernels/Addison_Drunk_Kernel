@@ -3805,7 +3805,21 @@ int sched_hmp_proc_update_handler(struct ctl_table *table, int write,
 	int ret;
 	unsigned int old_val;
 	unsigned int *data = (unsigned int *)table->data;
-	int update_min_nice = 0;
+	int update_task_count = 0;
+
+	if (!sched_enable_hmp)
+		return 0;
+
+	/*
+	 * The policy mutex is acquired with cpu_hotplug.lock
+	 * held from cpu_up()->cpufreq_governor_interactive()->
+	 * sched_set_window(). So enforce the same order here.
+	 */
+	if (write && (data == &sysctl_sched_upmigrate_pct ||
+	    data == (unsigned int *)&sysctl_sched_upmigrate_min_nice)) {
+		update_task_count = 1;
+		get_online_cpus();
+	}
 
 	mutex_lock(&policy_mutex);
 
@@ -3813,7 +3827,7 @@ int sched_hmp_proc_update_handler(struct ctl_table *table, int write,
 
 	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
 
-	if (ret || !write || !sched_enable_hmp)
+	if (ret || !write)
 		goto done;
 
 	if (write && (old_val == *data))
@@ -3828,7 +3842,6 @@ int sched_hmp_proc_update_handler(struct ctl_table *table, int write,
 			ret = -EINVAL;
 			goto done;
 		}
-		update_min_nice = 1;
 	} else if (data != &sysctl_sched_select_prev_cpu_us) {
 		/*
 		 * all tunables other than min_nice and prev_cpu_us are
@@ -3850,19 +3863,17 @@ int sched_hmp_proc_update_handler(struct ctl_table *table, int write,
 	 * includes taking runqueue lock of all online cpus and re-initiatizing
 	 * their big counter values based on changed criteria.
 	 */
-	if ((data == &sysctl_sched_upmigrate_pct || update_min_nice)) {
-		get_online_cpus();
+	if (update_task_count)
 		pre_big_task_count_change(cpu_online_mask);
-	}
 
 	set_hmp_defaults();
 
-	if ((data == &sysctl_sched_upmigrate_pct || update_min_nice)) {
+	if (update_task_count)
 		post_big_task_count_change(cpu_online_mask);
-		put_online_cpus();
-	}
 
 done:
+	if (update_task_count)
+		put_online_cpus();
 	mutex_unlock(&policy_mutex);
 	return ret;
 }
@@ -7507,6 +7518,13 @@ static int detach_tasks(struct lb_env *env)
 
 redo:
 	while (!list_empty(tasks)) {
+		/*
+		 * We don't want to steal all, otherwise we may be treated likewise,
+		 * which could at worst lead to a livelock crash.
+		 */
+		if (env->idle != CPU_NOT_IDLE && env->src_rq->nr_running <= 1)
+			break;
+
 		p = list_first_entry(tasks, struct task_struct, se.group_node);
 
 		env->loop++;
@@ -9951,14 +9969,16 @@ static void run_rebalance_domains(struct softirq_action *h)
 	enum cpu_idle_type idle = this_rq->idle_balance ?
 						CPU_IDLE : CPU_NOT_IDLE;
 
-	rebalance_domains(this_rq, idle);
-
 	/*
 	 * If this cpu has a pending nohz_balance_kick, then do the
 	 * balancing on behalf of the other idle cpus whose ticks are
-	 * stopped.
+	 * stopped. Do nohz_idle_balance *before* rebalance_domains to
+	 * give the idle cpus a chance to load balance. Else we may
+	 * load balance only within the local sched_domain hierarchy
+	 * and abort nohz_idle_balance altogether if we pull some load.
 	 */
 	nohz_idle_balance(this_rq, idle);
+	rebalance_domains(this_rq, idle);
 }
 
 /*

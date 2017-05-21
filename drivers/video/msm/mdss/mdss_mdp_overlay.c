@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2017, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -1456,6 +1456,21 @@ static void mdss_mdp_overlay_update_pm(struct mdss_overlay_private *mdp5_data)
 	activate_event_timer(mdp5_data->cpu_pm_hdl, wakeup_time);
 }
 
+static void __unstage_pipe_and_clean_buf(struct msm_fb_data_type *mfd,
+		struct mdss_mdp_pipe *pipe, struct mdss_mdp_data *buf)
+{
+
+	pr_debug("unstaging pipe:%d rect:%d buf:%d\n",
+			pipe->num, pipe->multirect.num, !buf);
+	MDSS_XLOG(pipe->num, pipe->multirect.num, !buf);
+	mdss_mdp_mixer_pipe_unstage(pipe, pipe->mixer_left);
+	mdss_mdp_mixer_pipe_unstage(pipe, pipe->mixer_right);
+	pipe->dirty = true;
+
+	if (buf)
+		__pipe_buf_mark_cleanup(mfd, buf);
+}
+
 static int __overlay_queue_pipes(struct msm_fb_data_type *mfd)
 {
 	struct mdss_overlay_private *mdp5_data = mfd_to_mdp5_data(mfd);
@@ -1567,7 +1582,6 @@ static int __overlay_queue_pipes(struct msm_fb_data_type *mfd)
 				pipe->num);
 			ret = -EINVAL;
 		}
-
 		/*
 		 * if we reach here without errors and buf == NULL
 		 * then solid fill will be set
@@ -1576,14 +1590,36 @@ static int __overlay_queue_pipes(struct msm_fb_data_type *mfd)
 			ret = mdss_mdp_pipe_queue_data(pipe, buf);
 
 		if (IS_ERR_VALUE(ret)) {
-			pr_warn("Unable to queue data for pnum=%d\n",
-					pipe->num);
-			mdss_mdp_mixer_pipe_unstage(pipe, pipe->mixer_left);
-			mdss_mdp_mixer_pipe_unstage(pipe, pipe->mixer_right);
-			pipe->dirty = true;
+			pr_warn("Unable to queue data for pnum=%d rect=%d\n",
+					pipe->num, pipe->multirect.num);
 
-			if (buf)
-				__pipe_buf_mark_cleanup(mfd, buf);
+			/*
+			 * If we fail for a multi-rect pipe, unstage both rects
+			 * so we don't leave the pipe configured in multi-rect
+			 * mode with only one rectangle staged.
+			 */
+			if (pipe->multirect.mode !=
+					MDSS_MDP_PIPE_MULTIRECT_NONE) {
+				struct mdss_mdp_pipe *next_pipe =
+					(struct mdss_mdp_pipe *)
+					pipe->multirect.next;
+
+				if (next_pipe) {
+					struct mdss_mdp_data *next_buf =
+						list_first_entry_or_null(
+							&next_pipe->buf_queue,
+							struct mdss_mdp_data,
+							pipe_list);
+
+					__unstage_pipe_and_clean_buf(mfd,
+							next_pipe, next_buf);
+				} else {
+					pr_warn("cannot find rect pnum=%d\n",
+							pipe->num);
+				}
+			}
+
+			__unstage_pipe_and_clean_buf(mfd, pipe, buf);
 		}
 	}
 
@@ -2003,8 +2039,9 @@ int mdss_mdp_overlay_kickoff(struct msm_fb_data_type *mfd,
 	struct mdss_mdp_ctl *ctl = mfd_to_ctl(mfd);
 	int ret = 0;
 	struct mdss_mdp_commit_cb commit_cb;
+	u8 sd_transition_state = 0;
 
-	if (!ctl)
+	if (!ctl || !ctl->mixer_left)
 		return -ENODEV;
 
 	ATRACE_BEGIN(__func__);
@@ -2046,7 +2083,8 @@ int mdss_mdp_overlay_kickoff(struct msm_fb_data_type *mfd,
 	if (ctl->ops.wait_pingpong && mdp5_data->mdata->serialize_wait4pp)
 		mdss_mdp_display_wait4pingpong(ctl, true);
 
-	if (mdp5_data->sd_transition_state != SD_TRANSITION_NONE) {
+	sd_transition_state = mdp5_data->sd_transition_state;
+	if (sd_transition_state != SD_TRANSITION_NONE) {
 		ret = __config_secure_display(mdp5_data);
 		if (IS_ERR_VALUE(ret)) {
 			pr_err("Secure session config failed\n");
@@ -2133,7 +2171,7 @@ int mdss_mdp_overlay_kickoff(struct msm_fb_data_type *mfd,
 	 * If we are transitioning from secure to non-secure display,
 	 * disable the secure display.
 	 */
-	if (mdp5_data->sd_enabled && (mdp5_data->sd_transition_state ==
+	if (mdp5_data->sd_enabled && (sd_transition_state ==
 			SD_TRANSITION_SECURE_TO_NON_SECURE)) {
 		ret = mdss_mdp_secure_display_ctrl(mdp5_data->mdata, 0);
 		if (!ret)
@@ -3988,12 +4026,21 @@ static int mdss_mdp_hw_cursor_pipe_update(struct msm_fb_data_type *mfd,
 		start_y = 0;
 	}
 
+	if ((img->width > mdata->max_cursor_size) ||
+		(img->height > mdata->max_cursor_size) ||
+		(img->depth != 32) || (start_x >= xres) ||
+		(start_y >= yres)) {
+		pr_err("Invalid cursor image coordinates\n");
+		ret = -EINVAL;
+		goto done;
+	}
+
 	roi.w = min(xres - start_x, img->width - roi.x);
 	roi.h = min(yres - start_y, img->height - roi.y);
 
 	if ((roi.w > mdata->max_cursor_size) ||
-		(roi.h > mdata->max_cursor_size) ||
-		(img->depth != 32) || (start_x >= xres) || (start_y >= yres)) {
+		(roi.h > mdata->max_cursor_size)) {
+		pr_err("Invalid cursor ROI size\n");
 		ret = -EINVAL;
 		goto done;
 	}
@@ -4024,12 +4071,6 @@ static int mdss_mdp_hw_cursor_pipe_update(struct msm_fb_data_type *mfd,
 	req->transp_mask = img->bg_color & ~(0xff << var->transp.offset);
 
 	if (mfd->cursor_buf && (cursor->set & FB_CUR_SETIMAGE)) {
-		if (img->width * img->height * 4 > cursor_frame_size) {
-			pr_err("cursor image size is too large\n");
-			ret = -EINVAL;
-			goto done;
-		}
-
 		ret = copy_from_user(mfd->cursor_buf, img->data,
 				     img->width * img->height * 4);
 		if (ret) {
@@ -5396,7 +5437,7 @@ static int mdss_mdp_overlay_off(struct msm_fb_data_type *mfd)
 		 * retire_signal api checks for retire_cnt with sync_mutex lock.
 		 */
 
-		flush_work(&mdp5_data->retire_work);
+		flush_kthread_work(&mdp5_data->vsync_work);
 	}
 
 ctl_stop:
@@ -5601,13 +5642,13 @@ static void __vsync_retire_handle_vsync(struct mdss_mdp_ctl *ctl, ktime_t t)
 	}
 
 	mdp5_data = mfd_to_mdp5_data(mfd);
-	schedule_work(&mdp5_data->retire_work);
+	queue_kthread_work(&mdp5_data->worker, &mdp5_data->vsync_work);
 }
 
-static void __vsync_retire_work_handler(struct work_struct *work)
+static void __vsync_retire_work_handler(struct kthread_work *work)
 {
 	struct mdss_overlay_private *mdp5_data =
-		container_of(work, typeof(*mdp5_data), retire_work);
+		container_of(work, typeof(*mdp5_data), vsync_work);
 
 	if (!mdp5_data->ctl || !mdp5_data->ctl->mfd)
 		return;
@@ -5698,6 +5739,7 @@ static int __vsync_retire_setup(struct msm_fb_data_type *mfd)
 {
 	struct mdss_overlay_private *mdp5_data = mfd_to_mdp5_data(mfd);
 	char name[24];
+	struct sched_param param = { .sched_priority = 5 };
 
 	snprintf(name, sizeof(name), "mdss_fb%d_retire", mfd->index);
 	mdp5_data->vsync_timeline = sw_sync_timeline_create(name);
@@ -5705,12 +5747,26 @@ static int __vsync_retire_setup(struct msm_fb_data_type *mfd)
 		pr_err("cannot vsync create time line");
 		return -ENOMEM;
 	}
+
+	init_kthread_worker(&mdp5_data->worker);
+	init_kthread_work(&mdp5_data->vsync_work, __vsync_retire_work_handler);
+
+	mdp5_data->thread = kthread_run(kthread_worker_fn,
+					&mdp5_data->worker, "vsync_retire_work");
+
+	if (IS_ERR(mdp5_data->thread)) {
+		pr_err("unable to start vsync thread\n");
+		mdp5_data->thread = NULL;
+		return -ENOMEM;
+	}
+
+	sched_setscheduler(mdp5_data->thread, SCHED_FIFO, &param);
+
 	mfd->mdp_sync_pt_data.get_retire_fence = __vsync_retire_get_fence;
 
 	mdp5_data->vsync_retire_handler.vsync_handler =
 		__vsync_retire_handle_vsync;
 	mdp5_data->vsync_retire_handler.cmd_post_flush = false;
-	INIT_WORK(&mdp5_data->retire_work, __vsync_retire_work_handler);
 
 	return 0;
 }

@@ -96,6 +96,38 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/sched.h>
 
+static atomic_t __su_instances;
+
+int su_instances(void)
+{
+	return atomic_read(&__su_instances);
+}
+
+bool su_running(void)
+{
+	return su_instances() > 0;
+}
+
+bool su_visible(void)
+{
+	kuid_t uid = current_uid();
+	if (su_running())
+		return true;
+	if (uid_eq(uid, GLOBAL_ROOT_UID) || uid_eq(uid, GLOBAL_SYSTEM_UID))
+		return true;
+	return false;
+}
+
+void su_exec(void)
+{
+	atomic_inc(&__su_instances);
+}
+
+void su_exit(void)
+{
+	atomic_dec(&__su_instances);
+}
+
 const char *task_event_names[] = {"PUT_PREV_TASK", "PICK_NEXT_TASK",
 				  "TASK_WAKE", "TASK_MIGRATE", "TASK_UPDATE",
 				"IRQ_UPDATE"};
@@ -3964,7 +3996,14 @@ static void remove_task_from_group(struct task_struct *p)
 
 	if (empty_group) {
 		list_del(&grp->list);
+		/*
+		 * RCU, kswapd etc tasks can get woken up from
+		 * call_rcu(). As the wakeup path also acquires
+		 * the related_thread_group_lock, drop it here.
+		 */
+		write_unlock(&related_thread_group_lock);
 		call_rcu(&grp->rcu, free_related_thread_group);
+		write_lock(&related_thread_group_lock);
 	}
 }
 
@@ -5023,6 +5062,28 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 
 	success = 1; /* we're going to change ->state */
 
+	/*
+	 * Ensure we load p->on_rq _after_ p->state, otherwise it would
+	 * be possible to, falsely, observe p->on_rq == 0 and get stuck
+	 * in smp_cond_load_acquire() below.
+	 *
+	 * sched_ttwu_pending()                 try_to_wake_up()
+	 *   [S] p->on_rq = 1;                  [L] P->state
+	 *       UNLOCK rq->lock  -----.
+	 *                              \
+	 *				 +---   RMB
+	 * schedule()                   /
+	 *       LOCK rq->lock    -----'
+	 *       UNLOCK rq->lock
+	 *
+	 * [task p]
+	 *   [S] p->state = UNINTERRUPTIBLE     [L] p->on_rq
+	 *
+	 * Pairs with the UNLOCK+LOCK on rq->lock from the
+	 * last wakeup of our task and the schedule that got our task
+	 * current.
+	 */
+	smp_rmb();
 	if (p->on_rq && ttwu_remote(p, wake_flags))
 		goto stat;
 
@@ -6904,6 +6965,20 @@ static bool check_same_owner(struct task_struct *p)
 	return match;
 }
 
+static bool dl_param_changed(struct task_struct *p,
+		const struct sched_attr *attr)
+{
+	struct sched_dl_entity *dl_se = &p->dl;
+
+	if (dl_se->dl_runtime != attr->sched_runtime ||
+		dl_se->dl_deadline != attr->sched_deadline ||
+		dl_se->dl_period != attr->sched_period ||
+		dl_se->flags != attr->sched_flags)
+		return true;
+
+	return false;
+}
+
 static int __sched_setscheduler(struct task_struct *p,
 				const struct sched_attr *attr,
 				bool user)
@@ -7032,7 +7107,7 @@ recheck:
 			goto change;
 		if (rt_policy(policy) && attr->sched_priority != p->rt_priority)
 			goto change;
-		if (dl_policy(policy))
+		if (dl_policy(policy) && dl_param_changed(p, attr))
 			goto change;
 
 		p->sched_reset_on_fork = reset_on_fork;
