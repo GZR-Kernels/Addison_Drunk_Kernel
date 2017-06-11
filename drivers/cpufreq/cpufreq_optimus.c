@@ -1,5 +1,5 @@
 /*
- *  drivers/cpufreq/cpufreq_conservative.c
+ *  drivers/cpufreq/cpufreq_optimus.c
  *
  *  Copyright (C)  2001 Russell King
  *            (C)  2003 Venkatesh Pallipadi <venkatesh.pallipadi@intel.com>.
@@ -12,14 +12,19 @@
  */
 
 #include <linux/slab.h>
+#include <linux/display_state.h>
 #include "cpufreq_governor.h"
 
-/* Conservative governor macros */
-#define DEF_FREQUENCY_UP_THRESHOLD		(80)
-#define DEF_FREQUENCY_DOWN_THRESHOLD		(20)
-#define DEF_FREQUENCY_STEP			(5)
+/* optimus governor macros */
+#define DEF_FREQUENCY_UP_THRESHOLD		(90)
+#define DEF_FREQUENCY_DOWN_THRESHOLD		(40)
+#define DEF_FREQUENCY_SUSPENDED_THRESHOLD    	(60)
+#define DEF_FREQUENCY_STEP			(10)
 #define DEF_SAMPLING_DOWN_FACTOR		(1)
 #define MAX_SAMPLING_DOWN_FACTOR		(10)
+#define DEF_OPTIMAL_FREQ                        (1401600)
+#define DEF_OPTIMAL_THRESHOLD                   (60)
+#define MICRO_FREQUENCY_MIN_SAMPLE_RATE	        (20000)
 
 static DEFINE_PER_CPU(struct cs_cpu_dbs_info_s, cs_cpu_dbs_info);
 static DEFINE_PER_CPU(struct cs_dbs_tuners *, cached_tuners);
@@ -52,6 +57,13 @@ static void cs_check_cpu(int cpu, unsigned int load)
 	struct dbs_data *dbs_data = policy->governor_data;
 	struct cs_dbs_tuners *cs_tuners = dbs_data->tuners;
 
+        /* Create display state boolean */
+	bool display_on = is_display_on();
+
+	/* Break out early once min freq reached during screen off */
+	if (!display_on && policy->cur == policy->min)
+		return;
+
 	/*
 	 * break out if we 'cannot' reduce the speed as the user might
 	 * want freq_step to be zero
@@ -59,21 +71,39 @@ static void cs_check_cpu(int cpu, unsigned int load)
 	if (cs_tuners->freq_step == 0)
 		return;
 
+        if (dbs_info->cdbs.deferred_periods < UINT_MAX) {
+		unsigned int freq_target = dbs_info->cdbs.deferred_periods *
+				get_freq_target(cs_tuners, policy);
+		if (dbs_info->requested_freq > freq_target)
+			dbs_info->requested_freq -= freq_target;
+		else
+			dbs_info->requested_freq = policy->min;
+		dbs_info->cdbs.deferred_periods = UINT_MAX;
+	}
+
 	/* Check for frequency increase */
-	if (load > cs_tuners->up_threshold) {
-		dbs_info->down_skip = 0;
+        if (load > DEF_OPTIMAL_THRESHOLD) {
+		if (load >= cs_tuners->up_threshold)
+			dbs_info->down_skip = 0;
 
 		/* if we are already at full speed then break out early */
-		if (dbs_info->requested_freq == policy->max)
+		if (policy->cur == policy->max)
 			return;
 
-		dbs_info->requested_freq += get_freq_target(cs_tuners, policy);
+                /* if display is off then break out early */
+		if (!display_on)
+			return;
+
+                if (load < cs_tuners->up_threshold)
+                        dbs_info->requested_freq = cs_tuners->optimal_freq;
+                else if (load >= cs_tuners->up_threshold)
+                        dbs_info->requested_freq += get_freq_target(cs_tuners, policy);
 
 		if (dbs_info->requested_freq > policy->max)
 			dbs_info->requested_freq = policy->max;
 
 		__cpufreq_driver_target(policy, dbs_info->requested_freq,
-			CPUFREQ_RELATION_H);
+			CPUFREQ_RELATION_C);
 		return;
 	}
 
@@ -83,8 +113,25 @@ static void cs_check_cpu(int cpu, unsigned int load)
 	dbs_info->down_skip = 0;
 
 	/* Check for frequency decrease */
-	if (load < cs_tuners->down_threshold) {
+	if (display_on && load < cs_tuners->down_threshold) {
 		unsigned int freq_target;
+		/*
+		 * if we cannot reduce the frequency anymore, break out early
+		 */
+		if (policy->cur == policy->min)
+			return;
+
+		freq_target = get_freq_target(cs_tuners, policy);
+		if (dbs_info->requested_freq > freq_target)
+			dbs_info->requested_freq -= freq_target;
+		else
+			dbs_info->requested_freq = policy->min;
+
+		__cpufreq_driver_target(policy, dbs_info->requested_freq,
+				CPUFREQ_RELATION_L);
+		return;
+        } else if (!display_on && load <= DEF_FREQUENCY_SUSPENDED_THRESHOLD) {
+                unsigned int freq_target;
 		/*
 		 * if we cannot reduce the frequency anymore, break out early
 		 */
@@ -268,12 +315,31 @@ static ssize_t store_freq_step(struct dbs_data *dbs_data, const char *buf,
 	return count;
 }
 
+static ssize_t store_optimal_freq(struct dbs_data *dbs_data, const char *buf,
+                size_t count)
+{
+        struct cs_dbs_tuners *cs_tuners = dbs_data->tuners;
+        unsigned int input;
+        int ret;
+        ret = sscanf(buf, "%u", &input);
+
+        if (ret != 1)
+                return -EINVAL;
+
+        if (input < 0)
+                input = 0;
+
+        cs_tuners->optimal_freq = input;
+        return count;
+}
+
 show_store_one(cs, sampling_rate);
 show_store_one(cs, sampling_down_factor);
 show_store_one(cs, up_threshold);
 show_store_one(cs, down_threshold);
 show_store_one(cs, ignore_nice_load);
 show_store_one(cs, freq_step);
+show_store_one(cs, optimal_freq);
 declare_show_sampling_rate_min(cs);
 
 gov_sys_pol_attr_rw(sampling_rate);
@@ -282,6 +348,7 @@ gov_sys_pol_attr_rw(up_threshold);
 gov_sys_pol_attr_rw(down_threshold);
 gov_sys_pol_attr_rw(ignore_nice_load);
 gov_sys_pol_attr_rw(freq_step);
+gov_sys_pol_attr_rw(optimal_freq);
 gov_sys_pol_attr_ro(sampling_rate_min);
 
 static struct attribute *dbs_attributes_gov_sys[] = {
@@ -292,12 +359,13 @@ static struct attribute *dbs_attributes_gov_sys[] = {
 	&down_threshold_gov_sys.attr,
 	&ignore_nice_load_gov_sys.attr,
 	&freq_step_gov_sys.attr,
+        &optimal_freq_gov_sys.attr,
 	NULL
 };
 
 static struct attribute_group cs_attr_group_gov_sys = {
 	.attrs = dbs_attributes_gov_sys,
-	.name = "conservative",
+	.name = "optimus",
 };
 
 static struct attribute *dbs_attributes_gov_pol[] = {
@@ -308,12 +376,13 @@ static struct attribute *dbs_attributes_gov_pol[] = {
 	&down_threshold_gov_pol.attr,
 	&ignore_nice_load_gov_pol.attr,
 	&freq_step_gov_pol.attr,
+        &optimal_freq_gov_pol.attr,
 	NULL
 };
 
 static struct attribute_group cs_attr_group_gov_pol = {
 	.attrs = dbs_attributes_gov_pol,
-	.name = "conservative",
+	.name = "optimus",
 };
 
 /************************** sysfs end ************************/
@@ -348,8 +417,9 @@ static struct cs_dbs_tuners *alloc_tuners(struct cpufreq_policy *policy)
 	tuners->sampling_down_factor = DEF_SAMPLING_DOWN_FACTOR;
 	tuners->ignore_nice_load = 0;
 	tuners->freq_step = DEF_FREQUENCY_STEP;
+        tuners->optimal_freq = DEF_OPTIMAL_FREQ;
 
-	save_tuners(policy, tuners);
+        save_tuners(policy, tuners);
 
 	return tuners;
 }
@@ -378,15 +448,14 @@ static int cs_init(struct dbs_data *dbs_data, struct cpufreq_policy *policy)
 	}
 
 	dbs_data->tuners = tuners;
-	dbs_data->min_sampling_rate = MIN_SAMPLING_RATE_RATIO *
-		jiffies_to_usecs(10);
+        dbs_data->min_sampling_rate = MICRO_FREQUENCY_MIN_SAMPLE_RATE;
 	mutex_init(&dbs_data->mutex);
 	return 0;
 }
 
 static void cs_exit(struct dbs_data *dbs_data)
 {
-	//nothing to do
+       //nothing to do
 }
 
 define_get_cpu_dbs_routines(cs_cpu_dbs_info);
@@ -418,11 +487,11 @@ static int cs_cpufreq_governor_dbs(struct cpufreq_policy *policy,
 	return cpufreq_governor_dbs(policy, &cs_dbs_cdata, event);
 }
 
-#ifndef CONFIG_CPU_FREQ_DEFAULT_GOV_CONSERVATIVE
+#ifndef CONFIG_CPU_FREQ_DEFAULT_GOV_OPTIMUS
 static
 #endif
-struct cpufreq_governor cpufreq_gov_conservative = {
-	.name			= "conservative",
+struct cpufreq_governor cpufreq_gov_optimus = {
+	.name			= "optimus",
 	.governor		= cs_cpufreq_governor_dbs,
 	.max_transition_latency	= TRANSITION_LATENCY_LIMIT,
 	.owner			= THIS_MODULE,
@@ -430,27 +499,26 @@ struct cpufreq_governor cpufreq_gov_conservative = {
 
 static int __init cpufreq_gov_dbs_init(void)
 {
-	return cpufreq_register_governor(&cpufreq_gov_conservative);
+	return cpufreq_register_governor(&cpufreq_gov_optimus);
 }
 
 static void __exit cpufreq_gov_dbs_exit(void)
 {
-	int cpu;
-
-	cpufreq_unregister_governor(&cpufreq_gov_conservative);
-	for_each_possible_cpu(cpu) {
+        int cpu;
+	cpufreq_unregister_governor(&cpufreq_gov_optimus);
+        for_each_possible_cpu(cpu) {
 		kfree(per_cpu(cached_tuners, cpu));
 		per_cpu(cached_tuners, cpu) = NULL;
 	}
 }
 
 MODULE_AUTHOR("Alexander Clouter <alex@digriz.org.uk>");
-MODULE_DESCRIPTION("'cpufreq_conservative' - A dynamic cpufreq governor for "
+MODULE_DESCRIPTION("'cpufreq_optimus' - A dynamic cpufreq governor for "
 		"Low Latency Frequency Transition capable processors "
 		"optimised for use in a battery environment");
 MODULE_LICENSE("GPL");
 
-#ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_CONSERVATIVE
+#ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_OPTIMUS
 fs_initcall(cpufreq_gov_dbs_init);
 #else
 module_init(cpufreq_gov_dbs_init);
