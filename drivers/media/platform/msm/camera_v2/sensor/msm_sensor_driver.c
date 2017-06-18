@@ -30,8 +30,6 @@ static int32_t msm_sensor_driver_platform_probe(struct platform_device *pdev);
 /* Static declaration */
 static struct msm_sensor_ctrl_t *g_sctrl[MAX_CAMERAS];
 
-extern void flash_led_strobe_en(int flag);
-
 static int msm_sensor_platform_remove(struct platform_device *pdev)
 {
 	struct msm_sensor_ctrl_t  *s_ctrl;
@@ -813,10 +811,6 @@ int32_t msm_sensor_driver_probe(void *setting,
 	camera_info->sensor_id = slave_info->sensor_id_info.sensor_id;
 	camera_info->sensor_id2 = slave_info->sensor_id_info.sensor_id2;
 	camera_info->sensor_id_mask = slave_info->sensor_id_info.sensor_id_mask;
-	camera_info->sensor_model_id_reg_addr =
-		slave_info->sensor_id_info.sensor_model_id_reg_addr;
-	camera_info->sensor_model_id =
-		slave_info->sensor_id_info.sensor_model_id;
 
 	/* Fill CCI master, slave address and CCI default params */
 	if (!s_ctrl->sensor_i2c_client) {
@@ -1098,9 +1092,6 @@ static int32_t msm_sensor_driver_get_dt_data(struct msm_sensor_ctrl_t *s_ctrl)
 	CDBG("%s qcom,rear_prox_interfering = %d\n", __func__,
 		sensordata->sensor_info->is_rear_prox_interfering);
 
-	s_ctrl->no_hw_strobe  =
-		of_property_read_bool(of_node, "qcom,no_hw_strobe");
-
 	return rc;
 
 FREE_VREG_DATA:
@@ -1164,11 +1155,6 @@ static int32_t msm_sensor_driver_parse(struct msm_sensor_ctrl_t *s_ctrl)
 	/* Store sensor control structure in static database */
 	g_sctrl[s_ctrl->id] = s_ctrl;
 	CDBG("g_sctrl[%d] %pK", s_ctrl->id, g_sctrl[s_ctrl->id]);
-
-	if (s_ctrl->no_hw_strobe) {
-		flash_led_strobe_en(0);
-		pr_info("%s force sw strobe, id %d\n", __func__, s_ctrl->id);
-	}
 
 	return rc;
 
