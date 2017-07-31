@@ -3599,8 +3599,9 @@ static bool is_battery_missing(struct fg_chip *chip)
 static int fg_cap_learning_process_full_data(struct fg_chip *chip)
 {
 	int cc_pc_val, rc = -EINVAL;
-	int64_t cc_soc_delta_pc;
+	unsigned int cc_soc_delta_pc;
 	int64_t delta_cc_uah;
+	uint64_t temp;
 	bool batt_missing = is_battery_missing(chip);
 
 	if (batt_missing) {
@@ -3623,19 +3624,21 @@ static int fg_cap_learning_process_full_data(struct fg_chip *chip)
 		goto fail;
 	}
 
-	cc_soc_delta_pc = abs(cc_pc_val - chip->learning_data.init_cc_pc_val);
-	cc_soc_delta_pc *= 100;
-
-	cc_soc_delta_pc = div64_s64(cc_soc_delta_pc, FULL_PERCENT_28BIT);
+	temp = abs(cc_pc_val - chip->learning_data.init_cc_pc_val);
+	cc_soc_delta_pc = DIV_ROUND_CLOSEST_ULL(temp * 100, FULL_PERCENT_28BIT);
 
 	delta_cc_uah = div64_s64(
-			chip->nom_cap_uah * cc_soc_delta_pc,
+			chip->learning_data.learned_cc_uah * cc_soc_delta_pc,
 			100);
 	chip->learning_data.cc_uah = delta_cc_uah + chip->learning_data.cc_uah;
 
-	pr_info("current cc_soc=%d cc_soc_pc=%lld total_cc_uah = %lld delta_cc_uah = %lld\n",
-		cc_pc_val, cc_soc_delta_pc,
-		chip->learning_data.cc_uah, delta_cc_uah);
+	if (fg_debug_mask & FG_AGING)
+		pr_info("current cc_soc=%d cc_soc_pc=%d init_cc_pc_val=%d delta_cc_uah=%lld learned_cc_uah=%lld total_cc_uah = %lld\n",
+				cc_pc_val, cc_soc_delta_pc,
+				chip->learning_data.init_cc_pc_val,
+				delta_cc_uah,
+				chip->learning_data.learned_cc_uah,
+				chip->learning_data.cc_uah);
 
 	return 0;
 
@@ -3761,7 +3764,7 @@ static void fg_cap_learning_post_process(struct fg_chip *chip)
 		return;
 	}
 
-	max_inc_val = chip->nom_cap_uah
+	max_inc_val = chip->learning_data.learned_cc_uah
 			* (1000 + chip->learning_data.max_increment);
 	do_div(max_inc_val, 1000);
 
@@ -3805,9 +3808,10 @@ static void fg_cap_learning_post_process(struct fg_chip *chip)
 	}
 
 	fg_cap_learning_save_data(chip);
-	pr_info("final cc_uah = %lld, learned capacity %lld -> %lld uah\n",
-		chip->learning_data.cc_uah,
-		old_cap, chip->learning_data.learned_cc_uah);
+	if (fg_debug_mask & FG_AGING)
+		pr_info("final cc_uah = %lld, learned capacity %lld -> %lld uah\n",
+				chip->learning_data.cc_uah,
+				old_cap, chip->learning_data.learned_cc_uah);
 }
 
 static int get_vbat_est_diff(struct fg_chip *chip)
@@ -3887,7 +3891,8 @@ static int fg_cap_learning_check(struct fg_chip *chip)
 
 			chip->learning_data.init_cc_pc_val = cc_pc_val;
 			chip->learning_data.active = true;
-			pr_info("SW_CC_SOC based learning init_CC_SOC=%d\n",
+			if (fg_debug_mask & FG_AGING)
+				pr_info("SW_CC_SOC based learning init_CC_SOC=%d\n",
 					chip->learning_data.init_cc_pc_val);
 		} else {
 			rc = fg_mem_masked_write(chip, CBITS_INPUT_FILTER_REG,
@@ -4155,10 +4160,10 @@ static void status_change_work(struct work_struct *work)
 	}
 	if ((chip->wa_flag & USE_CC_SOC_REG) && chip->bad_batt_detection_en
 			&& chip->safety_timer_expired) {
-		chip->sw_cc_soc_data.delta_soc =
-			DIV_ROUND_CLOSEST(abs(cc_soc -
-					chip->sw_cc_soc_data.init_cc_soc)
-					* 100, FULL_PERCENT_28BIT);
+		uint64_t delta_cc_soc = abs(cc_soc -
+					chip->sw_cc_soc_data.init_cc_soc);
+		chip->sw_cc_soc_data.delta_soc = DIV_ROUND_CLOSEST_ULL(
+				delta_cc_soc * 100, FULL_PERCENT_28BIT);
 		chip->sw_cc_soc_data.full_capacity =
 			chip->sw_cc_soc_data.delta_soc +
 			chip->sw_cc_soc_data.init_sys_soc;
